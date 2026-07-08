@@ -4743,6 +4743,10 @@ fn hardcoded_overview_bind(raw: Keysym, mods: ModifiersState) -> Option<Bind> {
         Keysym::Right => Action::FocusColumnRight,
         Keysym::Up => Action::FocusWindowOrWorkspaceUp,
         Keysym::Down => Action::FocusWindowOrWorkspaceDown,
+        Keysym::h => Action::FocusColumnLeft,
+        Keysym::l => Action::FocusColumnRight,
+        Keysym::k => Action::FocusWindowOrWorkspaceUp,
+        Keysym::j => Action::FocusWindowOrWorkspaceDown,
         _ => {
             return None;
         }
