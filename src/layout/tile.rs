@@ -56,6 +56,14 @@ pub struct Tile<W: LayoutElement> {
     /// right away, to avoid black backdrop flicker before the window has had a chance to resize.
     sizing_mode: SizingMode,
 
+    /// The tile size we last requested through [`Tile::request_tile_size()`].
+    ///
+    /// Window sizes must be integer logical pixels, so the request is floored, and the resulting
+    /// tile can be up to one logical pixel smaller than the fractional size the layout allocated
+    /// for it. Keeping the requested size around lets us recover that allocated size
+    /// ([`Tile::allocated_size()`]) so the layout and the border rendering can compensate for it.
+    requested_tile_size: Option<Size<f64, Logical>>,
+
     /// The black backdrop for fullscreen windows.
     fullscreen_backdrop: SolidColorBuffer,
 
@@ -194,6 +202,7 @@ impl<W: LayoutElement> Tile<W> {
             focus_ring: FocusRing::new(focus_ring_config),
             shadow: Shadow::new(shadow_config),
             sizing_mode,
+            requested_tile_size: None,
             fullscreen_backdrop: SolidColorBuffer::new((0., 0.), [0., 0., 0., 1.]),
             restore_to_floating: false,
             floating_window_size: None,
@@ -490,6 +499,12 @@ impl<W: LayoutElement> Tile<W> {
             .geometry_corner_radius()
             .expanded_by(border_width as f32)
             .scaled_by(1. - expanded_progress as f32);
+
+        // Stretch the border's far edges to reach the boundary the layout allocated for this tile
+        // (the adjacent tile or the screen edge), filling the sub-pixel slack. The tile's top-left
+        // position is encoded as -view_rect.loc. See Tile::compute_border_slack().
+        let tile_loc = Point::from((-view_rect.loc.x, -view_rect.loc.y));
+        self.border.set_slack(self.compute_border_slack(tile_loc));
         self.border.update_render_elements(
             border_window_size,
             is_active,
@@ -877,7 +892,7 @@ impl<W: LayoutElement> Tile<W> {
     }
 
     fn is_in_activation_region(&self, point: Point<f64, Logical>) -> bool {
-        let activation_region = Rectangle::from_size(self.tile_size());
+        let activation_region = Rectangle::from_size(self.allocated_size());
         activation_region.contains(point)
     }
 
@@ -899,10 +914,24 @@ impl<W: LayoutElement> Tile<W> {
 
     pub fn request_tile_size(
         &mut self,
-        mut size: Size<f64, Logical>,
+        size: Size<f64, Logical>,
         animate: bool,
         transaction: Option<Transaction>,
     ) {
+        self.requested_tile_size = Some(size);
+
+        self.window.request_size(
+            self.window_size_for_requested_tile_size(size),
+            SizingMode::Normal,
+            animate,
+            transaction,
+        );
+    }
+
+    fn window_size_for_requested_tile_size(
+        &self,
+        mut size: Size<f64, Logical>,
+    ) -> Size<i32, Logical> {
         // Can't go through effective_border_width() because we might be fullscreen.
         if !self.border.is_off() {
             let width = self.border.width();
@@ -913,12 +942,85 @@ impl<W: LayoutElement> Tile<W> {
         // The size request has to be i32 unfortunately, due to Wayland. We floor here instead of
         // round to avoid situations where proportionally-sized columns don't fit on the screen
         // exactly.
-        self.window.request_size(
-            size.to_i32_floor(),
-            SizingMode::Normal,
-            animate,
-            transaction,
-        );
+        size.to_i32_floor()
+    }
+
+    /// Returns the (generally fractional) tile size the layout allocated for this tile.
+    ///
+    /// Window sizes must be integer logical pixels, so at fractional scales a tile can't always
+    /// match its allocated size; the actual [`Tile::tile_size()`] ends up slightly (below one
+    /// logical pixel) smaller. Left unhandled, that remainder shows up as a thin line of background
+    /// peeking through between the window border and whatever is next to it (the screen edge or an
+    /// adjacent tile).
+    ///
+    /// To compensate, the layout packs tiles at their allocated boundaries (see [`TileData`]), and
+    /// when tiles abut directly the border stretches to reach them (see
+    /// [`Tile::compute_border_slack()`]).
+    ///
+    /// The allocation only exceeds the actual tile size when the window committed exactly the size
+    /// we requested from it. Otherwise (e.g. a window snapping to terminal cells) the window is
+    /// sized on its own accord, there's no "intended" boundary to fill toward, and the allocated
+    /// size is just the real tile size.
+    pub fn allocated_size(&self) -> Size<f64, Logical> {
+        let size = self.tile_size();
+
+        let Some(requested) = self.requested_tile_size else {
+            return size;
+        };
+
+        if !self.sizing_mode.is_normal() {
+            return size;
+        }
+
+        if self.window.size() != self.window_size_for_requested_tile_size(requested) {
+            return size;
+        }
+
+        // The window committed exactly what we asked for, so the (sub-pixel) remainder up to the
+        // requested size is genuine allocation slack.
+        Size::from((f64::max(size.w, requested.w), f64::max(size.h, requested.h)))
+    }
+
+    /// Computes how far the border's right and bottom edges should stretch beyond the actual tile
+    /// size so that they reach the boundary the layout allocated for this tile.
+    ///
+    /// `loc` is the tile's (unrounded) top-left position, i.e. `-view_rect.loc` from
+    /// [`Tile::update_render_elements()`]. The render path rounds tile positions to physical pixels
+    /// and places the adjacent tile at `round(loc + allocated_size)`, so we stretch the border's
+    /// far edges to land exactly there. Deriving the stretch from the difference of rounded
+    /// positions (rather than rounding each tile's size on its own) avoids the per-tile rounding
+    /// error that otherwise accumulates into a 1px overshoot or gap against the screen edge.
+    fn compute_border_slack(&self, loc: Point<f64, Logical>) -> Size<f64, Logical> {
+        // With a gap between tiles the slack is absorbed into the gap (which is background anyway),
+        // so keep the border its configured width rather than thickening it.
+        if self.options.layout.gaps > 0. {
+            return Size::default();
+        }
+
+        let size = self.tile_size();
+        let alloc = self.allocated_size();
+
+        // The far edge lands at the rounded position of the boundary the layout allocated for us;
+        // subtract our own rounded near edge to get the on-screen span, then the tile size to get
+        // the extra stretch. Only stretch an axis that actually has allocation slack, so floating
+        // tiles and integer-aligned tiles keep their exact border width.
+        let stretch = |near: f64, actual: f64, allocated: f64| {
+            if allocated <= actual {
+                return 0.;
+            }
+            let far = round_logical_in_physical(self.scale, near + allocated);
+            let near = round_logical_in_physical(self.scale, near);
+            f64::max(0., (far - near) - actual)
+        };
+        Size::from((
+            stretch(loc.x, size.w, alloc.w),
+            stretch(loc.y, size.h, alloc.h),
+        ))
+    }
+
+    #[cfg(test)]
+    pub fn border_slack(&self) -> Size<f64, Logical> {
+        self.border.slack()
     }
 
     pub fn tile_width_for_window_width(&self, size: f64) -> f64 {
@@ -959,6 +1061,8 @@ impl<W: LayoutElement> Tile<W> {
         animate: bool,
         transaction: Option<Transaction>,
     ) {
+        self.requested_tile_size = None;
+
         self.window.request_size(
             size.to_i32_round(),
             SizingMode::Maximized,
@@ -968,6 +1072,8 @@ impl<W: LayoutElement> Tile<W> {
     }
 
     pub fn request_fullscreen(&mut self, animate: bool, transaction: Option<Transaction>) {
+        self.requested_tile_size = None;
+
         self.window.request_size(
             self.view_size.to_i32_round(),
             SizingMode::Fullscreen,

@@ -3901,7 +3901,12 @@ impl TileData {
     }
 
     pub fn update<W: LayoutElement>(&mut self, tile: &Tile<W>) {
-        self.size = tile.tile_size();
+        // Pack tiles at their allocated (generally fractional) boundaries rather than their actual,
+        // integer-window-constrained sizes. Positions are rounded to physical pixels at render
+        // time, and the border stretches to meet those rounded boundaries, so tiles that should
+        // visually fill the view exactly (e.g. two 50% columns at a fractional scale) do so without
+        // a thin gap against the screen edge or a 1px overshoot past it.
+        self.size = tile.allocated_size();
         self.interactively_resizing_by_left_edge = tile
             .window()
             .interactive_resize_data()
@@ -4658,9 +4663,12 @@ impl<W: LayoutElement> Column<W> {
                     continue 'outer;
                 }
 
-                auto = tile.tile_height_for_window_height(
-                    tile.window_height_for_tile_height(auto).round().max(1.),
-                );
+                // Keep the fractional allocated tile height. The window itself is floored to
+                // integer logical pixels later in request_tile_size(), and the border stretches to
+                // fill the sub-pixel slack, exactly as for column widths. Rounding the height to an
+                // integer window here would instead bake the slack into the allocation and leave a
+                // thin line of background at the bottom edge. Only enforce a positive window size.
+                auto = f64::max(auto, tile.tile_height_for_window_height(1.));
 
                 height_left_2 -= auto;
                 total_weight_2 -= weight;
@@ -4675,11 +4683,10 @@ impl<W: LayoutElement> Column<W> {
                 };
                 let factor = weight / total_weight;
 
-                // Compute the current auto height.
+                // Compute the current auto height. Keep it fractional (see the note above); the
+                // window is floored in request_tile_size() and the border fills the slack.
                 let auto = height_left * factor;
-                let auto = tile.tile_height_for_window_height(
-                    tile.window_height_for_tile_height(auto).round().max(1.),
-                );
+                let auto = f64::max(auto, tile.tile_height_for_window_height(1.));
 
                 *h = WindowHeight::Fixed(auto);
                 height_left -= auto;

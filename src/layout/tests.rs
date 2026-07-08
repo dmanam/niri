@@ -3732,6 +3732,232 @@ fn workspace_render_geo_at_fractional_scale() {
     );
 }
 
+#[test]
+fn columns_fill_screen_width_at_fractional_scale() {
+    // Two 50% columns side by side. The floored (integer logical) window sizes don't add up to the
+    // allocated column widths, leaving a sub-pixel remainder that would otherwise show as a thin
+    // line of background between the two borders and at the screen edges. The border stretches to
+    // fill it (Tile::compute_border_slack()), and the working area reaches the physical output
+    // edge (compute_working_area()), so the two columns must:
+    //   * meet exactly in the middle, with no gap and no overlap,
+    //   * span the full physical output width, 0 .. output_width, reaching both screen edges,
+    //   * land every edge on a physical pixel.
+    // Checked across a range of fractional scales and border widths.
+    use approx::assert_abs_diff_eq;
+
+    for step in 5..=40u32 {
+        let scale = f64::from(step) / 20.; // 0.25 ..= 2.0
+        for border_width in [1., 2., 3.] {
+            let options = Options {
+                layout: niri_config::Layout {
+                    border: niri_config::Border {
+                        off: false,
+                        width: border_width,
+                        ..Default::default()
+                    },
+                    gaps: 0.,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+
+            let ops = [
+                Op::AddScaledOutput {
+                    id: 1,
+                    scale,
+                    layout_config: None,
+                },
+                Op::AddWindow {
+                    params: TestWindowParams::new(0),
+                },
+                Op::SetColumnWidth(SizeChange::SetProportion(50.)),
+                Op::Communicate(0),
+                Op::AddWindow {
+                    params: TestWindowParams::new(1),
+                },
+                Op::SetColumnWidth(SizeChange::SetProportion(50.)),
+                Op::Communicate(1),
+            ];
+
+            let mut layout = check_ops_with_options(options, ops);
+            // Populate the border slack, which is computed during rendering.
+            layout.update_render_elements(None);
+
+            let MonitorSet::Normal { monitors, .. } = &layout.monitor_set else {
+                unreachable!()
+            };
+
+            let mon = &monitors[0];
+            let ws = mon.active_workspace_ref();
+            let scale = ws.scale().fractional_scale();
+            let msg = format!("scale {scale}, border {border_width}");
+
+            // (left physical x, right physical x) for each column, borders included.
+            let mut cols: Vec<(f64, f64)> = ws
+                .tiles_with_render_positions()
+                .map(|(tile, pos, _)| {
+                    let filled = tile.tile_size().w + tile.border_slack().w;
+                    (pos.x * scale, (pos.x + filled) * scale)
+                })
+                .collect();
+            cols.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            assert_eq!(cols.len(), 2, "expected two columns ({msg})");
+
+            // Every edge lands on a physical pixel, so the borders render crisply.
+            for (left, right) in &cols {
+                assert_abs_diff_eq!(*left, left.round(), epsilon = 1e-6);
+                assert_abs_diff_eq!(*right, right.round(), epsilon = 1e-6);
+            }
+
+            // The left column's right border meets the right column's left edge exactly.
+            assert!((cols[0].1 - cols[1].0).abs() < 1e-6, "meet in middle ({msg})");
+
+            // Together the columns span the full physical output width, reaching both screen edges.
+            let output_width = (ws.view_size().w * scale).round();
+            assert!(cols[0].0.abs() < 1e-6, "reach left edge ({msg})");
+            assert!((cols[1].1 - output_width).abs() < 1e-6, "reach right edge ({msg})");
+        }
+    }
+}
+
+#[test]
+fn columns_do_not_overflow() {
+    // With two 50% columns side by side, the total occupied space should not exceed
+    // the screen width.
+    // Checked across a range of fractional scales, border widths, and gap sizes.
+    use approx::assert_abs_diff_eq;
+
+    for step in 5..=40u32 {
+        let scale = f64::from(step) / 20.; // 0.25 ..= 2.0
+        for border_width in [0., 1., 2., 3.] {
+            for gaps in [0., 1., 2., 3.] {
+                let options = Options {
+                    layout: niri_config::Layout {
+                        border: niri_config::Border {
+                            off: false,
+                            width: border_width,
+                            ..Default::default()
+                        },
+                        gaps: gaps,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+
+                let ops = [
+                    Op::AddScaledOutput {
+                        id: 1,
+                        scale,
+                        layout_config: None,
+                    },
+                    Op::AddWindow {
+                        params: TestWindowParams::new(0),
+                    },
+                    Op::SetColumnWidth(SizeChange::SetProportion(50.)),
+                    Op::Communicate(0),
+                    Op::AddWindow {
+                        params: TestWindowParams::new(1),
+                    },
+                    Op::SetColumnWidth(SizeChange::SetProportion(50.)),
+                    Op::Communicate(1),
+                ];
+
+                let mut layout = check_ops_with_options(options, ops);
+                // Populate the border slack, which is computed during rendering.
+                layout.update_render_elements(None);
+
+                let MonitorSet::Normal { monitors, .. } = &layout.monitor_set else {
+                    unreachable!()
+                };
+
+                let mon = &monitors[0];
+                let ws = mon.active_workspace_ref();
+                let scale = ws.scale().fractional_scale();
+                let msg = format!("scale {scale}, border {border_width}");
+
+                // (left physical x, right physical x) for each column, borders included.
+                let mut cols: Vec<(f64, f64)> = ws
+                    .tiles_with_render_positions()
+                    .map(|(tile, pos, _)| {
+                        let filled = tile.tile_size().w + tile.border_slack().w;
+                        (pos.x * scale, (pos.x + filled) * scale)
+                    })
+                    .collect();
+                cols.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                assert_eq!(cols.len(), 2, "expected two columns ({msg})");
+
+                // the columns don't exceed the screen width (modulo float rounding)
+                let output_width = (ws.view_size().w * scale).round();
+                assert!(cols[1].1 - output_width < 1e-9, "don't exceed screen width ({msg})");
+            }
+        }
+    }
+}
+
+#[test]
+fn window_fills_screen_height_at_fractional_scale() {
+    // A single full-height tiled window. Its window height is floored to integer logical pixels,
+    // but the layout keeps the fractional allocated height (update_tile_sizes()) and the border
+    // stretches to fill the slack, while the working area reaches the physical output edge
+    // (compute_working_area()). So the tile must span the full physical output height, 0 ..
+    // output_height, reaching the top and bottom screen edges on a physical pixel, regardless of
+    // scale or border width (the border width in particular changes which way the floored window
+    // height rounds).
+    use approx::assert_abs_diff_eq;
+
+    for step in 5..=40u32 {
+        let scale = f64::from(step) / 20.; // 0.25 ..= 2.0
+        for border_width in [1., 2., 3.] {
+            let options = Options {
+                layout: niri_config::Layout {
+                    border: niri_config::Border {
+                        off: false,
+                        width: border_width,
+                        ..Default::default()
+                    },
+                    gaps: 0.,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+
+            let ops = [
+                Op::AddScaledOutput {
+                    id: 1,
+                    scale,
+                    layout_config: None,
+                },
+                Op::AddWindow {
+                    params: TestWindowParams::new(0),
+                },
+                Op::Communicate(0),
+            ];
+
+            let mut layout = check_ops_with_options(options, ops);
+            layout.update_render_elements(None);
+
+            let MonitorSet::Normal { monitors, .. } = &layout.monitor_set else {
+                unreachable!()
+            };
+
+            let mon = &monitors[0];
+            let ws = mon.active_workspace_ref();
+            let scale = ws.scale().fractional_scale();
+            let output_height = (ws.view_size().h * scale).round();
+            let msg = format!("scale {scale}, border {border_width}");
+
+            let (tile, pos, _) = ws.tiles_with_render_positions().next().unwrap();
+            let top = pos.y * scale;
+            let bottom = (pos.y + tile.tile_size().h + tile.border_slack().h) * scale;
+
+            assert_abs_diff_eq!(top, top.round(), epsilon = 1e-6);
+            assert_abs_diff_eq!(bottom, bottom.round(), epsilon = 1e-6);
+            assert!(top.abs() < 1e-6, "reach top edge ({msg})");
+            assert!((bottom - output_height).abs() < 1e-6, "reach bottom edge ({msg})");
+        }
+    }
+}
+
 fn parent_id_causes_loop(layout: &Layout<TestWindow>, id: usize, mut parent_id: usize) -> bool {
     if parent_id == id {
         return true;
